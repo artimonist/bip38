@@ -311,7 +311,7 @@ pub trait Decrypt {
     /// * `Error::EncKey` is returned if the target `str` is not an valid encrypted private key.
     ///
     /// * `Error::Checksum` is returned if the target `str` has valid encrypted private key format
-    /// but invalid checksum.
+    ///   but invalid checksum.
     ///
     /// * `Error::Base58` is returned if an non `base58` character is found.
     ///
@@ -395,7 +395,7 @@ pub trait Decrypt {
     /// * `Error::EncKey` is returned if the target `str` is not an valid encrypted private key.
     ///
     /// * `Error::Checksum` is returned if the target `str` has valid encrypted private key format
-    /// but invalid checksum.
+    ///   but invalid checksum.
     ///
     /// * `Error::Base58` is returned if an non `base58` character is found.
     ///
@@ -528,10 +528,10 @@ pub trait EncryptWif {
     /// * `Error::Base58` is returned if an non `base58` character is found.
     ///
     /// * `Error::Checksum` is returned if the target `str` has valid `wif` format but invalid
-    /// checksum.
+    ///   checksum.
     ///
     /// * `Error::PrvKey` is returned if the decoded private key could not generate a bitcoin
-    /// address
+    ///   address
     ///
     /// * `Error::WifKey` is returned if the target `str` is not an valid `wif` private key.
     ///
@@ -682,14 +682,14 @@ impl BytesManipulation for [u8] {
     #[inline]
     fn hash160(&self) -> [u8; 20] {
         let mut result = [0x00; 20];
-        result[..].copy_from_slice(&Ripemd160::digest(&sha2::Sha256::digest(self)));
+        result[..].copy_from_slice(&Ripemd160::digest(sha2::Sha256::digest(self)));
         result
     }
 
     #[inline]
     fn hash256(&self) -> [u8; 32] {
         let mut result = [0x00; 32];
-        result[..].copy_from_slice(&sha2::Sha256::digest(&sha2::Sha256::digest(self)));
+        result[..].copy_from_slice(&sha2::Sha256::digest(sha2::Sha256::digest(self)));
         result
     }
 
@@ -741,39 +741,33 @@ impl Encrypt for [u8; 32] {
     #[inline]
     fn encrypt(&self, pass: &str, compress: bool) -> Result<String, Error> {
         let address = self.public(compress)?.p2wpkh()?;
-        let checksum = &address.as_bytes().hash256()[..4];
+        let checksum = &address.as_bytes().sha256_n(2)[..4];
+
         let mut scrypt_key = [0x00; 64];
-
-        scrypt::scrypt(
-            pass.nfc().collect::<String>().as_bytes(),
-            checksum,
-            &Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?,
-            &mut scrypt_key,
-        )
-        .map_err(|_| Error::ScryptFn)?;
-
-        let mut half1 = [0x00; 32];
-        half1[..].copy_from_slice(&scrypt_key[..32]);
-
-        let cipher = Aes256::new(GenericArray::from_slice(&scrypt_key[32..]));
-
-        for idx in 0..32 {
-            half1[idx] ^= self[idx];
+        {
+            let pass = pass.nfc().collect::<String>();
+            let params = Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?;
+            scrypt::scrypt(pass.as_bytes(), checksum, &params, &mut scrypt_key)
+                .map_err(|_| Error::ScryptFn)?;
         }
 
-        let mut part1 = GenericArray::clone_from_slice(&half1[..16]);
-        let mut part2 = GenericArray::clone_from_slice(&half1[16..]);
+        let (half1, half2) = scrypt_key.split_at_mut(32);
+        half1[..32].xor(&self[..32]);
+        let (part1, part2) = half1.split_at_mut(16);
 
-        cipher.encrypt_block(&mut part1);
-        cipher.encrypt_block(&mut part2);
+        let cipher = Aes256::new(GenericArray::from_slice(half2));
+        cipher.encrypt_block(GenericArray::from_mut_slice(part1));
+        cipher.encrypt_block(GenericArray::from_mut_slice(part2));
 
-        let mut buffer = [0x00; 39];
-        buffer[..2].copy_from_slice(&PRE_NON_EC);
-        buffer[2] = if compress { 0xe0 } else { 0xc0 };
-        buffer[3..7].copy_from_slice(checksum);
-        buffer[7..23].copy_from_slice(&part1);
-        buffer[23..].copy_from_slice(&part2);
-
+        let flag = if compress { 0xe0 } else { 0xc0 };
+        let buffer = [
+            &PRE_NON_EC[..2],
+            &[flag][..1],
+            &checksum[..4],
+            &part1[..16],
+            &part2[..16],
+        ]
+        .concat();
         Ok(buffer.encode_base58ck())
     }
 }
@@ -782,89 +776,71 @@ impl Generate for str {
     #[inline]
     fn generate(&self, compress: bool) -> Result<String, Error> {
         let mut owner_salt = [0x00; 8];
-        let mut pass_factor = [0x00; 32];
-        let mut seed_b = [0x00; 24];
-
         rand::thread_rng().fill_bytes(&mut owner_salt);
 
-        scrypt::scrypt(
-            self.nfc().collect::<String>().as_bytes(),
-            &owner_salt,
-            &Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?,
-            &mut pass_factor,
-        )
-        .map_err(|_| Error::ScryptFn)?;
-
-        let pass_point = pass_factor.public(true)?;
-
-        let mut pass_point_mul = PublicKey::from_slice(&pass_point).map_err(|_| Error::PubKey)?;
-
+        let mut seed_b = [0x00; 24];
         rand::thread_rng().fill_bytes(&mut seed_b);
 
-        let factor_b = Scalar::from_be_bytes(seed_b.hash256()).map_err(|_| Error::EcMul)?;
+        let mut pass_factor = [0x00; 32];
+        {
+            let pass = self.nfc().collect::<String>();
+            let params = Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?;
+            scrypt::scrypt(pass.as_bytes(), &owner_salt, &params, &mut pass_factor)
+                .map_err(|_| Error::ScryptFn)?;
+        }
+        let pass_point = pass_factor.public(true)?;
 
-        pass_point_mul = pass_point_mul
-            .mul_tweak(&Secp256k1::new(), &factor_b)
-            .map_err(|_| Error::EcMul)?;
+        let address_hash = {
+            let factor_b = Scalar::from_be_bytes(seed_b.sha256_n(2)).map_err(|_| Error::EcMul)?;
 
-        let pubk = if compress {
-            pass_point_mul.serialize().to_vec()
-        } else {
-            pass_point_mul.serialize_uncompressed().to_vec()
+            let mut pass_point_mul =
+                PublicKey::from_slice(&pass_point).map_err(|_| Error::PubKey)?;
+
+            pass_point_mul = pass_point_mul
+                .mul_tweak(&Secp256k1::new(), &factor_b)
+                .map_err(|_| Error::EcMul)?;
+
+            let pubk = if compress {
+                pass_point_mul.serialize().to_vec()
+            } else {
+                pass_point_mul.serialize_uncompressed().to_vec()
+            };
+
+            let address = pubk.p2wpkh()?;
+            address.as_bytes().sha256_n(2)[..4].to_vec()
         };
 
-        let address = pubk.p2wpkh()?;
-        let address_hash = &address.as_bytes().hash256()[..4];
-        let mut salt = [0x00; 12];
         let mut seed_b_pass = [0x00; 64];
-
-        salt[..4].copy_from_slice(address_hash);
-        salt[4..].copy_from_slice(&owner_salt);
-
-        scrypt::scrypt(
-            &pass_point,
-            &salt,
-            &Params::new(10, 1, 1, LEN_SCRY).map_err(|_| Error::ScryptParam)?,
-            &mut seed_b_pass,
-        )
-        .map_err(|_| Error::ScryptFn)?;
-
-        let derived_half1 = &seed_b_pass[..32];
-        let derived_half2 = &seed_b_pass[32..];
-        let en_p1 = &mut seed_b[..16];
-
-        for idx in 0..16 {
-            en_p1[idx] ^= derived_half1[idx];
+        {
+            let salt = [&address_hash[..4], &owner_salt[..8]].concat();
+            let params = Params::new(10, 1, 1, LEN_SCRY).map_err(|_| Error::ScryptParam)?;
+            scrypt::scrypt(&pass_point, &salt, &params, &mut seed_b_pass)
+                .map_err(|_| Error::ScryptFn)?;
         }
 
-        let cipher = Aes256::new(GenericArray::from_slice(derived_half2));
-        let mut encrypted_part1 = GenericArray::clone_from_slice(en_p1);
+        let (part1, part2) = {
+            let [part1, part2, half2] = seed_b_pass.segments_mut([16, 16, 32]);
+            let cipher = Aes256::new(GenericArray::from_slice(half2));
 
-        cipher.encrypt_block(&mut encrypted_part1);
+            part1[..16].xor(&seed_b[..16]);
+            cipher.encrypt_block(GenericArray::from_mut_slice(part1));
 
-        let mut en_p2 = [0x00; 16];
-        en_p2[..8].copy_from_slice(&encrypted_part1[8..]);
-        en_p2[8..].copy_from_slice(&seed_b[16..]);
-
-        for idx in 0..16 {
-            en_p2[idx] ^= derived_half1[idx + 16];
-        }
-
-        let mut encrypted_part2 = GenericArray::clone_from_slice(&en_p2);
-
-        cipher.encrypt_block(&mut encrypted_part2);
+            part2[..16].xor(&[&part1[8..16], &seed_b[16..24]].concat());
+            cipher.encrypt_block(GenericArray::from_mut_slice(part2));
+            (part1, part2)
+        };
 
         let flag = if compress { 0x20 } else { 0x00 };
-
-        let mut result_bytes = [0x00; 39];
-        result_bytes[..2].copy_from_slice(&PRE_EC);
-        result_bytes[2] = flag;
-        result_bytes[3..7].copy_from_slice(address_hash);
-        result_bytes[7..15].copy_from_slice(&owner_salt);
-        result_bytes[15..23].copy_from_slice(&encrypted_part1[..8]);
-        result_bytes[23..].copy_from_slice(&encrypted_part2);
-
-        Ok(result_bytes.encode_base58ck())
+        let buffer = [
+            &PRE_EC[..2],
+            &[flag][..1],
+            &address_hash[..4],
+            &owner_salt[..8],
+            &part1[..8],
+            &part2[..16],
+        ]
+        .concat();
+        Ok(buffer.encode_base58ck())
     }
 }
 
@@ -929,77 +905,55 @@ impl StringManipulation for str {
         if eprvk[..2] != PRE_EC {
             return Err(Error::EncKey);
         }
-        let address_hash = &eprvk[3..7];
-        let encrypted_p1 = &eprvk[15..23];
-        let encrypted_p2 = &eprvk[23..39];
-        let flag_byte: u8 = eprvk[2];
-        let compress = (flag_byte & 0x20) == 0x20;
-        let has_lot = (flag_byte & 0x04) == 0x04;
-        let owner_entropy = &eprvk[7..15];
-        let owner_salt = &eprvk[7..15 - (flag_byte & 0x04) as usize];
-        let mut pre_factor = [0x00; 32];
-        let mut pass_factor = [0x00; 32];
-
-        scrypt::scrypt(
-            pass.nfc().collect::<String>().as_bytes(),
-            owner_salt,
-            &Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?,
-            &mut pre_factor,
-        )
-        .map_err(|_| Error::ScryptFn)?;
-
-        if has_lot {
-            let mut tmp: Vec<u8> = Vec::new();
-            tmp.append(&mut pre_factor.to_vec());
-            tmp.append(&mut owner_entropy.to_vec());
-            pass_factor[..].copy_from_slice(&tmp.hash256());
+        let [flag, address_hash, owner_entropy, epart1, epart2] =
+            eprvk[2..].segments([1, 4, 8, 8, 16]);
+        let compress = (flag[0] & 0x20) == 0x20;
+        let has_lot = (flag[0] & 0x04) == 0x04;
+        let owner_salt = if has_lot {
+            &owner_entropy[..4]
         } else {
-            pass_factor = pre_factor;
-        }
+            &owner_entropy[..8]
+        };
 
-        let pass_point = pass_factor.public(true)?;
+        let pass_factor = {
+            let mut pre_factor = [0x00; 32];
+            let pass = pass.nfc().collect::<String>();
+            let params = Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?;
+            scrypt::scrypt(pass.as_bytes(), owner_salt, &params, &mut pre_factor)
+                .map_err(|_| Error::ScryptFn)?;
+
+            if has_lot {
+                [&pre_factor, &owner_entropy[..8]].concat().sha256_n(2)
+            } else {
+                pre_factor
+            }
+        };
+
         let mut seed_b_pass = [0x00; 64];
-
-        scrypt::scrypt(
-            &pass_point,
-            &eprvk[3..15], // 1024 log2 = 10
-            &Params::new(10, 1, 1, LEN_SCRY).map_err(|_| Error::ScryptParam)?,
-            &mut seed_b_pass,
-        )
-        .map_err(|_| Error::ScryptFn)?;
-
-        let derived_half1 = &seed_b_pass[..32];
-        let derived_half2 = &seed_b_pass[32..];
-
-        let cipher = Aes256::new(GenericArray::from_slice(derived_half2));
-
-        let mut de_p2 = GenericArray::clone_from_slice(encrypted_p2);
-
-        cipher.decrypt_block(&mut de_p2);
-
-        for idx in 0..16 {
-            de_p2[idx] ^= derived_half1[idx + 16];
+        {
+            let pass_point = pass_factor.public(true)?;
+            let salt = [&address_hash[..4], &owner_entropy[..8]].concat();
+            let params = Params::new(10, 1, 1, LEN_SCRY).map_err(|_| Error::ScryptParam)?;
+            scrypt::scrypt(&pass_point, &salt, &params, &mut seed_b_pass)
+                .map_err(|_| Error::ScryptFn)?;
         }
 
-        let seed_b_part2 = &de_p2[8..];
+        let factor_b = {
+            let [part1, part2, half2] = seed_b_pass.segments_mut([16, 16, 32]);
 
-        let mut tmp = [0x00; 16];
-        tmp[..8].copy_from_slice(encrypted_p1);
-        tmp[8..].copy_from_slice(&de_p2[..8]);
+            let cipher = Aes256::new(GenericArray::from_slice(half2));
 
-        let mut de_p1 = GenericArray::clone_from_slice(&tmp);
+            let tmp2 = &mut epart2.to_vec();
+            cipher.decrypt_block(GenericArray::from_mut_slice(tmp2));
+            part2[..16].xor(&tmp2[..16]);
 
-        cipher.decrypt_block(&mut de_p1);
+            let tmp1 = &mut [&epart1[..8], &part2[..8]].concat();
+            cipher.decrypt_block(GenericArray::from_mut_slice(tmp1));
+            part1[..16].xor(&tmp1[..16]);
 
-        for idx in 0..16 {
-            de_p1[idx] ^= derived_half1[idx];
-        }
-
-        let mut seed_b = [0x00; 24];
-        seed_b[..16].copy_from_slice(&de_p1);
-        seed_b[16..].copy_from_slice(seed_b_part2);
-
-        let factor_b = seed_b.hash256();
+            let seed_b = [&part1[..16], &part2[8..16]].concat();
+            seed_b.sha256_n(2)
+        };
 
         let mut prv = SecretKey::from_slice(&pass_factor).map_err(|_| Error::PrvKey)?;
 
@@ -1011,57 +965,101 @@ impl StringManipulation for str {
         result[..].copy_from_slice(&prv[..]);
 
         let address = result.public(compress)?.p2wpkh()?;
-        let checksum = &address.as_bytes().hash256()[..4];
+        let checksum = &address.as_bytes().sha256_n(2)[..4];
 
         if checksum != address_hash {
             return Err(Error::Pass);
         }
-
         Ok((result, compress))
     }
 
     #[inline]
     fn decrypt_non_ec(&self, pass: &str) -> Result<([u8; 32], bool), Error> {
-        let eprvk = self.decode_base58ck()?;
+        let mut eprvk = self.decode_base58ck()?;
         if eprvk[..2] != PRE_NON_EC {
             return Err(Error::EncKey);
         }
-        let compress = (eprvk[2] & 0x20) == 0x20;
+
+        let [ref flag, ref salt, epart1, epart2] = eprvk[2..].segments_mut([1, 4, 16, 16]);
+        let compress = (flag[0] & 0x20) == 0x20;
+
         let mut scrypt_key = [0x00; 64];
-
-        scrypt::scrypt(
-            pass.nfc().collect::<String>().as_bytes(),
-            &eprvk[3..7], // 16384 log2 = 14
-            &Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?,
-            &mut scrypt_key,
-        )
-        .map_err(|_| Error::ScryptFn)?;
-
-        let cipher = Aes256::new(GenericArray::from_slice(&scrypt_key[32..]));
-
-        let mut derived_half1 = GenericArray::clone_from_slice(&eprvk[7..23]);
-        let mut derived_half2 = GenericArray::clone_from_slice(&eprvk[23..39]);
-
-        cipher.decrypt_block(&mut derived_half1);
-        cipher.decrypt_block(&mut derived_half2);
-
-        for idx in 0..16 {
-            derived_half1[idx] ^= scrypt_key[idx];
-            derived_half2[idx] ^= scrypt_key[idx + 16];
+        {
+            let pass = pass.nfc().collect::<String>();
+            let params = Params::new(14, 8, 8, LEN_SCRY).map_err(|_| Error::ScryptParam)?;
+            scrypt::scrypt(pass.as_bytes(), salt, &params, &mut scrypt_key)
+                .map_err(|_| Error::ScryptFn)?;
         }
 
-        let mut prvk = [0x00; 32];
-        prvk[..16].copy_from_slice(&derived_half1);
-        prvk[16..].copy_from_slice(&derived_half2);
+        let prvk: [u8; 32] = {
+            let [part1, part2, aes_key] = scrypt_key.segments_mut([16, 16, 32]);
+
+            let cipher = Aes256::new(GenericArray::from_slice(aes_key));
+            cipher.decrypt_block(GenericArray::from_mut_slice(epart1));
+            cipher.decrypt_block(GenericArray::from_mut_slice(epart2));
+            part1[..16].xor(&epart1[..16]);
+            part2[..16].xor(&epart2[..16]);
+
+            [&part1[..16], &part2[..16]].concat().try_into().unwrap()
+        };
 
         let address = prvk.public(compress)?.p2wpkh()?;
-        let checksum = &address.as_bytes().hash256()[..4];
+        let checksum = &address.as_bytes().sha256_n(2)[..4];
 
-        if checksum != &eprvk[3..7] {
+        if checksum != *salt {
             return Err(Error::Pass);
         }
 
         Ok((prvk, compress))
+    }
+}
+
+trait ByteOperation {
+    fn sha256_n(&self, n: usize) -> [u8; 32];
+    fn xor(&mut self, other: &Self);
+    fn segments<const N: usize>(&self, len_list: [usize; N]) -> [&[u8]; N];
+    fn segments_mut<const N: usize>(&mut self, len_list: [usize; N]) -> [&mut [u8]; N];
+}
+
+impl ByteOperation for [u8] {
+    #[inline(always)]
+    fn sha256_n(&self, n: usize) -> [u8; 32] {
+        assert!(n > 0, "Cannot hash zero times");
+
+        let mut hash = sha2::Sha256::digest(self);
+        for _ in 1..n {
+            hash = sha2::Sha256::digest(hash);
+        }
+        hash.into()
+    }
+
+    #[inline(always)]
+    fn xor(&mut self, other: &Self) {
+        debug_assert!(self.len() == other.len());
+        (0..self.len()).for_each(|i| self[i] ^= other[i]);
+    }
+
+    #[inline]
+    fn segments<const N: usize>(&self, len_list: [usize; N]) -> [&[u8]; N] {
+        let mut start = 0;
+        let mut segments = [&self[..0]; N];
+        for (i, &len) in len_list.iter().enumerate() {
+            segments[i] = &self[start..start + len];
+            start += len;
+        }
+        segments
+    }
+
+    #[inline]
+    fn segments_mut<const N: usize>(&mut self, lens: [usize; N]) -> [&mut [u8]; N] {
+        let mut segments = vec![];
+        let mut rest = self;
+        for len in lens {
+            let (part1, part2) = rest.split_at_mut(len);
+            segments.push(part1);
+            rest = part2;
+        }
+        segments.try_into().unwrap()
     }
 }
 
